@@ -18,9 +18,94 @@ SECURITY_AUDIT_COMMANDS = [
     "show running-config ssl",
     "show running-config logging",
     "show run | include threat-detection",
-    "show run | include ikev",
+    "show run access-list",
+    "show run object",
+    "show run object-group",
     "show version"
 ]
+
+WEAK_SERVICES = ("telnet", "ftp", "tftp", "rsh", "finger")
+
+def analyze_acls_and_objects(output):
+    """
+    Analyze ACLs and object usage:
+    - Detect ANY/ANY rules
+    - Detect weak services (telnet, ftp, tftp, rsh, finger)
+    - Detect duplicate ACL entries
+    - Detect unused objects
+    """
+
+    acl_lines = []
+    object_names = set()
+    object_references = set()
+
+    # Split into lines for easier processing
+    lines = output.splitlines()
+
+    for line in lines:
+        line = line.strip()
+
+        # Collect ACL lines
+        if line.startswith("access-list "):
+            acl_lines.append(line)
+
+        # Collect object definitions
+        # e.g. "object network OBJ-SERVER1"
+        m_obj = re.match(r"object\s+(network|service)\s+(\S+)", line)
+        if m_obj:
+            object_names.add(m_obj.group(2))
+
+        # Collect object-group definitions
+        # e.g. "object-group network OG-SERVERS"
+        m_og = re.match(r"object-group\s+\S+\s+(\S+)", line)
+        if m_og:
+            object_names.add(m_og.group(1))
+
+        # Track references to objects/object-groups
+        # e.g. "object OBJ-SERVER1" or "object-group OG-SERVERS"
+        m_ref = re.search(r"\bobject(?:-group)?\s+(\S+)", line)
+        if m_ref:
+            object_references.add(m_ref.group(1))
+
+    # ANY/ANY and weak services
+    any_any_found = False
+    weak_service_found = False
+
+    # Duplicate ACL detection
+    seen_acls = set()
+    duplicate_found = False
+
+    for acl in acl_lines:
+        # Normalize ACL line for duplicate detection
+        norm = " ".join(acl.split())
+        if norm in seen_acls:
+            duplicate_found = True
+        else:
+            seen_acls.add(norm)
+
+        # ANY/ANY detection (permit ip any any or similar)
+        # Very simple heuristic
+        if re.search(r"\bpermit\b\s+\S*\s+any\s+any\b", acl):
+            any_any_found = True
+
+        # Weak services detection
+        for svc in WEAK_SERVICES:
+            if re.search(rf"\b{svc}\b", acl, re.IGNORECASE):
+                weak_service_found = True
+                break
+
+    # Unused objects = defined but never referenced
+    unused_objects = object_names - object_references
+    unused_objects_flag = "Yes" if unused_objects else "No"
+
+    return {
+        "Any_Any_Rule": "Yes" if any_any_found else "No",
+        "Weak_Service_Rule": "Yes" if weak_service_found else "No",
+        "Duplicate_ACL_Rule": "Yes" if duplicate_found else "No",
+        "Unused_Objects": unused_objects_flag,
+        "Unused_Object_Count": len(unused_objects)
+    }
+
 
 def parse_asa_output(output):
     """
@@ -36,6 +121,11 @@ def parse_asa_output(output):
         'Logging_Enabled': 'No',
         'Threat_Detection': 'No',
         'Weak_VPN_Crypto': 'No',
+        'Any_Any_Rule': 'No',
+        'Weak_Service_Rule': 'No',
+        'Duplicate_ACL_Rule': 'No',
+        'Unused_Objects': 'No',
+        'Unused_Object_Count': 0,
     }
 
     # ASA Version
@@ -73,6 +163,10 @@ def parse_asa_output(output):
     # Weak crypto detection (3DES, MD5, DH2)
     if re.search(r"3des|md5|group2", output, re.IGNORECASE):
         data["Weak_VPN_Crypto"] = "Yes"
+
+    # ACL / object analysis
+    acl_obj_results = analyze_acls_and_objects(output)
+    data.update(acl_obj_results)
 
     return data
 
@@ -126,6 +220,11 @@ def run_compliance_check():
                 "Logging_Enabled": "N/A",
                 "Threat_Detection": "N/A",
                 "Weak_VPN_Crypto": "N/A",
+                "Any_Any_Rule": "N/A",
+                "Weak_Service_Rule": "N/A",
+                "Duplicate_ACL_Rule": "N/A",
+                "Unused_Objects": "N/A",
+                "Unused_Object_Count": 0,
             })
             all_results.append(device_data)
 
@@ -143,6 +242,11 @@ def run_compliance_check():
             "Logging_Enabled",
             "Threat_Detection",
             "Weak_VPN_Crypto",
+            "Any_Any_Rule",
+            "Weak_Service_Rule",
+            "Duplicate_ACL_Rule",
+            "Unused_Objects",
+            "Unused_Object_Count",
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
